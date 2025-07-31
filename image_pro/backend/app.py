@@ -56,19 +56,13 @@ def upload():
                         new_width = int(width)
                         new_height = int(height)
                     elif width:
-                        # only width provided, calculate height based on aspect ratio
+                        # only width provided, calculate height using original aspect ratio
                         new_width = int(width)
-                        if aspect_ratio:  # the aspect ratio would be sent as [width_ratio, height_ratio]
-                            new_height = new_width * aspect_ratio[1] / aspect_ratio[0]
-                        else:
-                            new_height = int(original_height * new_width / original_width)
+                        new_height = int(original_height * new_width / original_width)
                     else:
-                        # only height provided, calculate width based on aspect ratio
+                        # only height provided, calculate width using original aspect ratio
                         new_height = int(height)
-                        if aspect_ratio:
-                            new_width = new_height * aspect_ratio[0] / aspect_ratio[1]
-                        else:
-                            new_width = int(original_width * new_height / original_height)
+                        new_width = int(original_width * new_height / original_height)
 
                     img_resized = img.resize((new_width, new_height), resample=Image.LANCZOS)
                 else:
