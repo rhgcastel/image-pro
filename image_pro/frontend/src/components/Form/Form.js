@@ -180,114 +180,97 @@ function Form() {
             img.onload = () => resolve(img);
         });
 
-    const handleApiCall = async (formData) => {
-        try {
-            const response = await axios.post("http://localhost:5000/upload", formData);
-            for (var pair of formData.entries()) {
-                console.log(pair[0]+ ', '+ pair[1]);
+        const handleApiCall = async (formData) => {
+            try {
+                const response = await axios.post("http://localhost:5000/upload", formData, {
+                    headers: {
+                        'Content-Type': 'multipart/form-data',
+                    },
+                    withCredentials: true, 
+                });
+                console.log('Upload successful', response.data);
+                return response.data;
+            } catch (error) {
+                console.error("Error uploading the image:", error);
             }
-            return response.data;
-        } catch (error) {
-            console.error("Error uploading the image:", error);
-        }
-    };
+        };
+        
 
     const clearAll = () => {
         dispatch({type: 'SET_IMAGES', payload: []});
         dispatch({type: 'SET_CLEAR_DIALOG_OPEN', payload: false});
     };
 
-    const onSubmit = async (data, optimize) => {
-        const files = data.file;
+    const onSubmit = async (data, optimize = false) => {
+        const files = state.fileList;
         const formWidth = state.newWidthValue;
         const formHeight = state.newHeightValue;
-
+    
+        if (!files.length) {
+            console.error("No files uploaded.");
+            return;
+        }
+    
         if (!optimize) {
-            // Resize function
+            // Resize validation
             if (formWidth && (formWidth < 1 || formWidth > 8000)) {
                 dispatch({type: 'SET_DIMENSION_ERROR', payload: true});
                 return;
             }
-
+    
             if (formHeight && (formHeight < 1 || formHeight > 8000)) {
                 dispatch({type: 'SET_DIMENSION_ERROR', payload: true});
                 return;
             }
-        } else {
-            const totalFileSize = Array.from(files).reduce(
-                (total, file) => total + file.size,
-                0
-            );
-            if (totalFileSize > 50 * 1024 * 1024) {
-                dispatch({type: 'SET_FILE_SIZE_ERROR', payload: true});
-                return;
-            }
         }
-
+    
         dispatch({type: 'SET_PROCESSING', payload: true});
-
-        const processImages = async (width, height) => {
-            console.log('Processing images with width and height: ', width, height);
-            const formData = new FormData();
-            if (width && height) {
-                formData.append("width", width);
-                formData.append("height", height);
-            }
-            formData.append("optimize", optimize);
-            if (optimize) {
-                formData.append("quality", state.quality);
-                console.log("Quality sent to backend: ", state.quality);
-            }
-
-            const originalImageDataUrls = [];
-            for (const file of files) {
-                const originalImageDataUrl = await readFileAsDataUrl(file);
-                originalImageDataUrls.push(originalImageDataUrl);
-                formData.append("file[]", file);
-            }
-
-            try {
-                const responseDataArray = await handleApiCall(formData);
-                console.log('Response data: ', responseDataArray);
-                for (let i = 0; i < responseDataArray.length; i++) {
-                    const responseData = responseDataArray[i];
-                    const optimizedImage = {
-                        filename: responseData.filename.replace(/\.[^/.]+$/, ""),
-                        originalImage: originalImageDataUrls[i],
-                        optimizedImage: responseData.optimized_image_url,
-                        originalSizeMB: (
-                            responseData.original_size /
-                            (1024 * 1024)
-                        ).toFixed(2),
-                        optimizedSizeMB: (
-                            responseData.optimized_size /
-                            (1024 * 1024)
-                        ).toFixed(2),
-                        originalImageWidth: responseData.original_width,
-                        originalImageHeight: responseData.original_height,
-                        newImageWidth: responseData.new_width,
-                        newImageHeight: responseData.new_height,
-                        operation: optimize ? "Optimized" : "Resized",
-                        quality: state.quality,
-                        resizedImage: responseData.resized_image_data
-                    };
-
-                    dispatch({type: 'ADD_IMAGE', payload: optimizedImage});
-                    fileInputRef.current.value = "";
-                }
-            } catch (error) {
-                console.error("Error uploading the image:", error);
-            }
-        };
-
-        await processImages(formWidth, formHeight);
-
+    
+        const formData = new FormData();
+        if (formWidth && formHeight) {
+            formData.append("width", formWidth);
+            formData.append("height", formHeight);
+        }
+        formData.append("optimize", optimize);
+        formData.append("quality", state.quality);
+    
+        files.forEach((file) => {
+            formData.append("file[]", file);
+        });
+    
+        const responseDataArray = await handleApiCall(formData);
+    
+        if (!responseDataArray || !responseDataArray.length) {
+            console.error("No response data received from backend.");
+            return;
+        }
+    
+        responseDataArray.forEach((responseData, i) => {
+            const optimizedImage = {
+                filename: responseData.filename.replace(/\.[^/.]+$/, ""),
+                originalImage: URL.createObjectURL(files[i]),
+                optimizedImage: responseData.optimized_image_url,
+                originalSizeMB: (responseData.original_size / (1024 * 1024)).toFixed(2),
+                optimizedSizeMB: (responseData.optimized_size / (1024 * 1024)).toFixed(2),
+                originalImageWidth: responseData.original_width,
+                originalImageHeight: responseData.original_height,
+                newImageWidth: responseData.new_width,
+                newImageHeight: responseData.new_height,
+                operation: optimize ? "Optimized" : "Resized",
+                quality: state.quality,
+                resizedImage: responseData.resized_image_data
+            };
+    
+            dispatch({type: 'ADD_IMAGE', payload: optimizedImage});
+        });
+    
+        fileInputRef.current.value = "";
         dispatch({type: 'SET_PROCESSING', payload: false});
+        dispatch({type: 'SET_FILE_LIST', payload: []});
         setValue("width", "");
         setValue("height", "");
-        dispatch({type: 'SET_FILE_LIST', payload: []});
-
     };
+    
 
     const downloadAll = async () => {
         const zip = new JSZip();
