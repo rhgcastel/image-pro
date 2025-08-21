@@ -17,6 +17,9 @@ import ErrorDialogs from "./components/ErrorDialogs";
 import {imageReducer} from "../../reducer/imageReducer";
 import {initialState} from "../../reducer/initialState";
 
+const API_BASE =
+  import.meta?.env?.VITE_API_URL || process.env.REACT_APP_API_URL || "http://127.0.0.1:5050";
+
 export const ImageContext = createContext({
     state: initialState,
     dispatch: () => null,
@@ -26,7 +29,7 @@ function Form() {
     const [state, dispatch] = useReducer(imageReducer, initialState);
     const {register, handleSubmit, watch, setValue} = useForm();
     const fileInputRef = useRef();
-    const validTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/tiff'];
+    const validTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/tiff', 'image/webp'];
     const width = watch("width");
     const height = watch("height");
 
@@ -180,20 +183,24 @@ function Form() {
             img.onload = () => resolve(img);
         });
 
-        const handleApiCall = async (formData) => {
-            try {
-                const response = await axios.post("http://localhost:5000/upload", formData, {
-                    headers: {
-                        'Content-Type': 'multipart/form-data',
-                    },
-                    withCredentials: true, 
-                });
-                console.log('Upload successful', response.data);
-                return response.data;
-            } catch (error) {
-                console.error("Error uploading the image:", error);
-            }
-        };
+        const handleApiCall = async (formData: FormData) => {
+  try {
+    const response = await axios.post(`${API_BASE}/upload`, formData, {
+      // Let the browser set the multipart boundary:
+      headers: { /* "Content-Type": will be set automatically */ },
+      // If you don't use cookies/sessions, skip withCredentials:
+      withCredentials: false,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    });
+    console.log("Upload successful", response.data);
+    return response.data;
+  } catch (error) {
+    console.error("Error uploading the image:", error);
+    return null; // make failure explicit
+  }
+};
+
         
 
     const clearAll = () => {
@@ -202,74 +209,73 @@ function Form() {
     };
 
     const onSubmit = async (data, optimize = false) => {
-        const files = state.fileList;
-        const formWidth = state.newWidthValue;
-        const formHeight = state.newHeightValue;
-    
-        if (!files.length) {
-            console.error("No files uploaded.");
-            return;
-        }
-    
-        if (!optimize) {
-            // Resize validation
-            if (formWidth && (formWidth < 1 || formWidth > 8000)) {
-                dispatch({type: 'SET_DIMENSION_ERROR', payload: true});
-                return;
-            }
-    
-            if (formHeight && (formHeight < 1 || formHeight > 8000)) {
-                dispatch({type: 'SET_DIMENSION_ERROR', payload: true});
-                return;
-            }
-        }
-    
-        dispatch({type: 'SET_PROCESSING', payload: true});
-    
-        const formData = new FormData();
-        if (formWidth && formHeight) {
-            formData.append("width", formWidth);
-            formData.append("height", formHeight);
-        }
-        formData.append("optimize", optimize);
-        formData.append("quality", state.quality);
-    
-        files.forEach((file) => {
-            formData.append("file[]", file);
-        });
-    
-        const responseDataArray = await handleApiCall(formData);
-    
-        if (!responseDataArray || !responseDataArray.length) {
-            console.error("No response data received from backend.");
-            return;
-        }
-    
-        responseDataArray.forEach((responseData, i) => {
-            const optimizedImage = {
-                filename: responseData.filename.replace(/\.[^/.]+$/, ""),
-                originalImage: URL.createObjectURL(files[i]),
-                optimizedImage: responseData.optimized_image_url,
-                originalSizeMB: (responseData.original_size / (1024 * 1024)).toFixed(2),
-                optimizedSizeMB: (responseData.optimized_size / (1024 * 1024)).toFixed(2),
-                originalImageWidth: responseData.original_width,
-                originalImageHeight: responseData.original_height,
-                newImageWidth: responseData.new_width,
-                newImageHeight: responseData.new_height,
-                operation: optimize ? "Optimized" : "Resized",
-                quality: state.quality,
-                resizedImage: responseData.resized_image_data
-            };
-    
-            dispatch({type: 'ADD_IMAGE', payload: optimizedImage});
-        });
-    
-        fileInputRef.current.value = "";
-        dispatch({type: 'SET_PROCESSING', payload: false});
-        dispatch({type: 'SET_FILE_LIST', payload: []});
-        setValue("width", "");
-        setValue("height", "");
+  const files = state.fileList;
+  const formWidth = state.newWidthValue;
+  const formHeight = state.newHeightValue;
+
+  if (!files.length) {
+    console.error("No files uploaded.");
+    return;
+  }
+
+  if (!optimize) {
+    if (formWidth && (formWidth < 1 || formWidth > 8000)) {
+      dispatch({ type: "SET_DIMENSION_ERROR", payload: true });
+      return;
+    }
+    if (formHeight && (formHeight < 1 || formHeight > 8000)) {
+      dispatch({ type: "SET_DIMENSION_ERROR", payload: true });
+      return;
+    }
+  }
+
+  dispatch({ type: "SET_PROCESSING", payload: true });
+
+  const formData = new FormData();
+
+  // Send either dimension if provided; backend already falls back to original
+  if (formWidth) formData.append("width", String(formWidth));
+  if (formHeight) formData.append("height", String(formHeight));
+
+  // Backend expects 'true'/'false' strings
+  formData.append("optimize", optimize ? "true" : "false");
+  if (optimize) formData.append("quality", String(state.quality));
+
+  files.forEach((file) => formData.append("file[]", file));
+
+  const responseDataArray = await handleApiCall(formData);
+
+  if (!responseDataArray || !responseDataArray.length) {
+    console.error("No response data received from backend.");
+    dispatch({ type: "SET_PROCESSING", payload: false });
+    return;
+  }
+
+  responseDataArray.forEach((responseData, i) => {
+    const optimizedImage = {
+      filename: responseData.filename.replace(/\.[^/.]+$/, ""),
+      originalImage: URL.createObjectURL(files[i]),
+      optimizedImage: responseData.optimized_image_url,
+      originalSizeMB: (responseData.original_size / (1024 * 1024)).toFixed(2),
+      optimizedSizeMB: (responseData.optimized_size / (1024 * 1024)).toFixed(2),
+      originalImageWidth: responseData.original_width,
+      originalImageHeight: responseData.original_height,
+      newImageWidth: responseData.new_width,
+      newImageHeight: responseData.new_height,
+      operation: optimize ? "Optimized" : "Resized",
+      quality: state.quality,
+      resizedImage: responseData.resized_image_data,
     };
+    dispatch({ type: "ADD_IMAGE", payload: optimizedImage });
+  });
+
+  fileInputRef.current.value = "";
+  dispatch({ type: "SET_FILE_LIST", payload: [] });
+  setValue("width", "");
+  setValue("height", "");
+  dispatch({ type: "SET_PROCESSING", payload: false });
+};
+
     
 
     const downloadAll = async () => {

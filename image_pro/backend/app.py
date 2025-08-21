@@ -2,130 +2,172 @@ from flask import Flask, request, send_from_directory, jsonify, url_for
 from flask_cors import CORS
 from PIL import Image, ImageOps
 import piexif
-import os
-import base64
-import io
-import sys
+import os, base64, io, sys
 
-# Flask App Initialization
 app = Flask(__name__)
+CORS(app,
+     resources={r"/*": {"origins": ["http://localhost:3000"]}},
+     supports_credentials=True,
+     methods=["GET","POST","OPTIONS"],
+     allow_headers=["Content-Type","Authorization"])
 
-# Enable CORS for React frontend
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}}, supports_credentials=True)
-
-# Directories for uploaded and processed files
-input_dir = "./input"
-output_dir = "./output"
-
-# Ensure directories exist
+input_dir, output_dir = "./input", "./output"
 os.makedirs(input_dir, exist_ok=True)
 os.makedirs(output_dir, exist_ok=True)
 
+@app.get("/health")
+def health():
+    return jsonify(ok=True)
 
-# Helper Function: Convert Image to Base64
-def image_to_base64(image):
-    buffered = io.BytesIO()
-    image.save(buffered, format="JPEG")
-    img_str = base64.b64encode(buffered.getvalue()).decode('ascii')
-    return f"data:image/jpeg;base64,{img_str}"
+def image_to_base64(image, fmt="JPEG"):
+    buf = io.BytesIO()
+    image.save(buf, format=fmt)
+    return "data:image/{};base64,{}".format(fmt.lower(), base64.b64encode(buf.getvalue()).decode("ascii"))
 
+def _safe_int(v, default=None):
+    try:
+        return int(v) if v not in (None, "", "null", "undefined") else default
+    except Exception:
+        return default
 
-# Upload Route
 @app.route('/upload', methods=['POST', 'OPTIONS'])
 def upload():
     if request.method == 'OPTIONS':
-        # Handle CORS preflight request
         return '', 200
 
     try:
-        # Get uploaded files
-        uploaded_files = request.files.getlist('file[]')
-        width = request.form.get('width')
-        height = request.form.get('height')
-        optimize = request.form.get('optimize') == 'true'
-        quality = int(request.form.get('quality')) if optimize else None
+        # accept multiple possible field names
+        uploaded_files = []
+        if "file[]" in request.files:
+            uploaded_files = request.files.getlist("file[]")
+        elif "files[]" in request.files:
+            uploaded_files = request.files.getlist("files[]")
+        elif "file" in request.files:
+            uploaded_files = [request.files["file"]]
+        elif "image" in request.files:
+            uploaded_files = [request.files["image"]]
+
+        width  = _safe_int(request.form.get('width'))
+        height = _safe_int(request.form.get('height'))
+        optimize = str(request.form.get('optimize')).lower() == 'true'
+        quality  = _safe_int(request.form.get('quality'), 82) if optimize else None
 
         if not uploaded_files:
-            return jsonify({"error": "No files uploaded"}), 400
+            return jsonify({"error": "No files uploaded (expected 'file[]', 'files[]', 'file' or 'image')"}), 400
 
-        response_data = []
+        resp = []
 
-        for uploaded_file in uploaded_files:
-            filename = uploaded_file.filename
-
-            if not filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.tiff', '.tif')):
+        for uf in uploaded_files:
+            filename = uf.filename or "image"
+            if not filename.lower().endswith(('.jpg','.jpeg','.png','.gif','.tiff','.tif','.webp')):
                 return jsonify({"error": f"Invalid file format for {filename}"}), 400
 
-            # Save uploaded file
             input_path = os.path.join(input_dir, filename)
-            uploaded_file.save(input_path)
+            uf.save(input_path)
 
-            # Open the uploaded image
             img = Image.open(input_path)
-            original_width, original_height = img.size
+            orig_w, orig_h = img.size
             original_size = os.path.getsize(input_path)
 
-            # Resize the image if width/height are provided
+            # resize if one or both provided (fallback to original)
+            target_w = width  or orig_w
+            target_h = height or orig_h
             if width or height:
-                width = int(width) if width else original_width
-                height = int(height) if height else original_height
-                img_resized = img.resize((width, height), resample=Image.LANCZOS)
-            else:
-                img_resized = img
+                img = img.resize((target_w, target_h), resample=Image.LANCZOS)
 
-            # Convert image to RGB if necessary
-            if img_resized.mode == 'RGBA':
-                img_resized = img_resized.convert('RGB')
+            # convert to appropriate mode for saving
+            if img.mode in ("P","LA","RGBA"):
+                img = img.convert("RGBA") if filename.lower().endswith(".png") else img.convert("RGB")
 
-            # Save optimized or resized image
-            output_path = os.path.join(output_dir, filename)
+            out_path = os.path.join(output_dir, filename)
+
+            # decide format by extension
+            ext = os.path.splitext(filename)[1].lower()
+            fmt = "JPEG" if ext in (".jpg",".jpeg") else "PNG" if ext==".png" else None
 
             if optimize:
-                try:
-                    exif_dict = piexif.load(img.info.get("exif", b""))
-                    exif_bytes = piexif.dump(exif_dict)
-                except (AttributeError, KeyError):
-                    exif_bytes = b''
+                # Preserve EXIF for JPEGs only
+                exif_bytes = b""
+                if fmt == "JPEG":
+                    try:
+                        exif_dict = piexif.load(Image.open(input_path).info.get("exif", b""))
+                        exif_bytes = piexif.dump(exif_dict)
+                    except Exception:
+                        exif_bytes = b""
 
-                img_optimized = ImageOps.autocontrast(img_resized, cutoff=0)
-                img_optimized.save(output_path, optimize=True, quality=quality, exif=exif_bytes)
+                if fmt == "JPEG":
+                    # JPEG: encode efficiently without altering appearance
+                    work = img.convert("RGB")
+                    work.save(
+                        out_path,
+                        format="JPEG",
+                        quality=quality or 82,     # slider
+                        optimize=True,
+                        progressive=True,          # smaller/better decode
+                        subsampling=2,             # 4:2:0; good balance
+                        exif=exif_bytes
+                    )
+
+                elif fmt == "PNG":
+                    # PNG: lossless; ignore 'quality' and just compress more
+                    work = img  # keep exact pixels, including alpha
+                    work.save(
+                        out_path,
+                        format="PNG",
+                        optimize=True,
+                        compress_level=9           # max zlib compression
+                    )
+
+                else:
+                    # Other formats: try to save without changing pixels
+                    img.save(out_path, optimize=True)
+
+
             else:
-                img_resized.save(output_path)
+                if fmt:
+                    img.save(out_path, format=fmt)
+                else:
+                    img.save(out_path)
 
-            optimized_size = os.path.getsize(output_path)
+            optimized_size = os.path.getsize(out_path)
             optimized_image_url = url_for('get_image', filename=filename, _external=True)
 
-            response_data.append({
+            # base64 preview as JPEG (small convenience)
+            preview_fmt = "JPEG"
+            preview_img = img.convert("RGB")
+            preview_b64 = image_to_base64(preview_img, preview_fmt)
+
+            resp.append({
                 "filename": filename,
                 "original_size": original_size,
                 "optimized_size": optimized_size,
-                "original_width": original_width,
-                "original_height": original_height,
-                "new_width": width,
-                "new_height": height,
+                "original_width": orig_w,
+                "original_height": orig_h,
+                "new_width": target_w,
+                "new_height": target_h,
                 "optimized_image_url": optimized_image_url,
-                "resized_image_data": image_to_base64(img_resized) if not optimize else "",
+                "resized_image_data": "" if optimize else preview_b64
             })
 
-            # Delete original file after processing
             os.remove(input_path)
 
-        return jsonify(response_data), 200
+        return jsonify(resp), 200
 
     except Exception as e:
-        print(f"An error occurred: {e}", file=sys.stderr)
+        print(f"[upload] error: {e}", file=sys.stderr)
         return jsonify({"error": str(e)}), 500
 
-
-# Route to Serve Processed Images
-@app.route('/output/<filename>')
+@app.route('/output/<path:filename>')
 def get_image(filename):
     return send_from_directory(output_dir, filename)
 
+# ---- run server ----
+if __name__ == "__main__":
+    # sensible limits + clearer logs
+    app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
+    app.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
 
-# Run Flask App
-if __name__ == '__main__':
-    print("Starting Flask Server...")
-    print(f"Python version: {sys.version}")
-    print(f"Python executable: {sys.executable}")
-    app.run(host='localhost', port=5000, debug=True)
+    print("Starting Flask on http://127.0.0.1:5050")
+    # debug=False avoids the reloader spawning a child that looks like a no-op
+    app.run(host="127.0.0.1", port=5050, debug=False, threaded=True)
+
