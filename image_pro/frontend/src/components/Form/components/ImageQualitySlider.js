@@ -40,11 +40,6 @@ function ImageQualitySlider() {
         max={99}
         disabled={disabled}
       />
-      {allPNG && (
-        <Typography variant="caption" sx={{ display: "block", mt: 0.5, opacity: 0.8 }}>
-          PNG is lossless; quality only affects JPEG/WebP. Use Optimize for PNG (lossless/quantized) or convert format.
-        </Typography>
-      )}
     </Box>
   );
 }
