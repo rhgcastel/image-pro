@@ -4,33 +4,49 @@ import { Box } from "@mui/material";
 import axios from "axios";
 import JSZip from "jszip";
 import { saveAs } from "file-saver";
+
 import FileInputField from "./components/FileInputField";
 import ImageQualitySlider from "./components/ImageQualitySlider";
 import DimensionFields from "./components/DimensionFields";
-import AspectRatioSelect from "./components/AspectRatioSelect";
+// import AspectRatioSelect from "./components/AspectRatioSelect";
 import ActionButtons from "./components/ActionButtons";
 import ClearDialog from "./components/ClearDialog";
 import DownloadButton from "./components/DownloadButton";
 import ImageGrid from "./components/ImageGrid";
 import SnackbarProcessing from "./components/SnackbarProcessing";
 import ErrorDialogs from "./components/ErrorDialogs";
+
 import { imageReducer } from "../../reducer/imageReducer";
 import { initialState } from "../../reducer/initialState";
-
-const API_BASE =
-  import.meta?.env?.VITE_API_URL ||
-  process.env.REACT_APP_API_URL ||
-  "http://127.0.0.1:5050";
 
 export const ImageContext = createContext({
   state: initialState,
   dispatch: () => null,
+  onSubmit: () => null,
+  handleSubmit: () => null,
+  register: () => null,
+  watch: () => null,
+  setValue: () => null,
+  downloadAll: () => null,
+  fileInputRef: null,
+  handleFileChange: () => null,
+  handleWidthChange: () => null,
+  handleHeightChange: () => null,
+  clearAll: () => null,
 });
+
+// Configurable API base (Vite or CRA), falls back to local Flask
+const API_BASE =
+  (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_URL) ||
+  process.env.REACT_APP_API_URL ||
+  "http://127.0.0.1:5050";
 
 function Form() {
   const [state, dispatch] = useReducer(imageReducer, initialState);
   const { register, handleSubmit, watch, setValue } = useForm();
   const fileInputRef = useRef();
+  const originalFilesRef = useRef([]); // <- keep immutable originals for optimize
+
   const validTypes = [
     "image/png",
     "image/jpeg",
@@ -38,15 +54,16 @@ function Form() {
     "image/tiff",
     "image/webp",
   ];
-  const hasFiles = state.fileList.length > 0;
-  const allPNG =
-    hasFiles && state.fileList.every((f) => f.type === "image/png");
-  // Disable the quality slider only when all files are PNG and you’re not converting formats
-  const qualityDisabled = allPNG; // adjust if you later add "convert to JPEG/WebP"
 
   const width = watch("width");
   const height = watch("height");
 
+  // Derived UI state
+  const hasFiles = state.fileList && state.fileList.length > 0;
+  const allPNG = hasFiles && state.fileList.every((f) => f.type === "image/png");
+  const qualityDisabled = allPNG; // quality doesn't apply to PNG unless converting
+
+  // Maintain aspect ratio logic (unchanged from your version)
   useEffect(() => {
     if (state.maintainAspectRatio && !state.manualChange) {
       const calculatedHeight = Math.round(
@@ -92,28 +109,26 @@ function Form() {
   };
 
   const handleFileChange = async (e) => {
-    const files = e.target.files;
+    const files = Array.from(e.target.files || []);
     const validFiles = [];
     const invalidFiles = [];
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      if (validTypes.includes(file.type)) {
-        validFiles.push(file);
-      } else {
-        invalidFiles.push(file.name);
-      }
+      if (validTypes.includes(file.type)) validFiles.push(file);
+      else invalidFiles.push(file.name);
     }
 
     if (invalidFiles.length > 0) {
       dispatch({ type: "SET_INVALID_FILE_NAMES", payload: invalidFiles });
       dispatch({ type: "SET_INVALID_FILES_DIALOG_OPEN", payload: true });
-      fileInputRef.current.value = "";
+      if (fileInputRef.current) fileInputRef.current.value = "";
       return;
     }
 
     dispatch({ type: "SET_QUALITY", payload: 85 });
     dispatch({ type: "SET_FILE_LIST", payload: validFiles });
+    originalFilesRef.current = validFiles; // <- preserve originals for optimize
 
     if (validFiles.length === 1) {
       const img = await createImage(validFiles[0]);
@@ -134,12 +149,9 @@ function Form() {
     const newWidth = e.target.value;
     dispatch({ type: "SET_NEW_WIDTH_VALUE", payload: newWidth });
 
-    if (state.maintainAspectRatio) {
+    if (state.maintainAspectRatio && state.fileList[0]) {
       const img = await createImage(state.fileList[0]);
-      const originalWidth = img.width;
-      const originalHeight = img.height;
-      const originalAspectRatio = originalWidth / originalHeight;
-
+      const originalAspectRatio = img.width / img.height;
       const newHeight = Math.round(newWidth / originalAspectRatio);
       setValue("height", newHeight);
       dispatch({ type: "SET_NEW_HEIGHT_VALUE", payload: newHeight });
@@ -150,52 +162,22 @@ function Form() {
     const newHeight = e.target.value;
     dispatch({ type: "SET_NEW_HEIGHT_VALUE", payload: newHeight });
 
-    if (state.maintainAspectRatio) {
+    if (state.maintainAspectRatio && state.fileList[0]) {
       const img = await createImage(state.fileList[0]);
-      const originalWidth = img.width;
-      const originalHeight = img.height;
-      const originalAspectRatio = originalWidth / originalHeight;
-
+      const originalAspectRatio = img.width / img.height;
       const newWidth = Math.round(newHeight * originalAspectRatio);
       setValue("width", newWidth);
       dispatch({ type: "SET_NEW_WIDTH_VALUE", payload: newWidth });
     }
   };
 
-  const handleAspectRatioChange = async (e) => {
-    const isAspectRatioChecked = e.target.checked;
-    dispatch({ type: "SET_ASPECT_RATIO", payload: isAspectRatioChecked });
-
-    if (state.fileList.length === 0) return;
-
-    const img = await createImage(state.fileList[0]);
-    const originalWidth = img.width;
-    const originalHeight = img.height;
-    const originalAspectRatio = originalWidth / originalHeight;
-
-    if (isAspectRatioChecked) {
-      if (state.width) {
-        // If width is set
-        const newHeight = Math.round(state.width / originalAspectRatio);
-        setValue("height", newHeight);
-        dispatch({ type: "SET_NEW_HEIGHT_VALUE", payload: newHeight });
-      } else if (state.height) {
-        // If height is set
-        const newWidth = Math.round(state.height * originalAspectRatio);
-        setValue("width", newWidth);
-        dispatch({ type: "SET_NEW_WIDTH_VALUE", payload: newWidth });
-      }
-    }
-  };
-
-  const readFileAsDataUrl = (file) => {
-    return new Promise((resolve, reject) => {
+  const readFileAsDataUrl = (file) =>
+    new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
       reader.onerror = (error) => reject(error);
       reader.readAsDataURL(file);
     });
-  };
 
   const createImage = (file) =>
     new Promise((resolve) => {
@@ -204,42 +186,46 @@ function Form() {
       img.onload = () => resolve(img);
     });
 
-  const handleApiCall = async (formData: FormData) => {
+  const handleApiCall = async (formData) => {
     try {
       const response = await axios.post(`${API_BASE}/upload`, formData, {
-        // Let the browser set the multipart boundary:
-        headers: {
-          /* "Content-Type": will be set automatically */
-        },
-        // If you don't use cookies/sessions, skip withCredentials:
+        // Let the browser set the multipart boundary automatically
+        headers: {},
         withCredentials: false,
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
       });
-      console.log("Upload successful", response.data);
       return response.data;
     } catch (error) {
       console.error("Error uploading the image:", error);
-      return null; // make failure explicit
+      return null;
     }
   };
 
   const clearAll = () => {
     dispatch({ type: "SET_IMAGES", payload: [] });
     dispatch({ type: "SET_CLEAR_DIALOG_OPEN", payload: false });
+    originalFilesRef.current = [];
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    dispatch({ type: "SET_FILE_LIST", payload: [] });
+    setValue("width", "");
+    setValue("height", "");
   };
 
   const onSubmit = async (data, optimize = false) => {
-    const files = state.fileList;
     const formWidth = state.newWidthValue;
     const formHeight = state.newHeightValue;
 
-    if (!files.length) {
+    // Use originals for OPTIMIZE; current selection for RESIZE
+    const sourceFiles = optimize ? originalFilesRef.current : state.fileList;
+
+    if (!sourceFiles || !sourceFiles.length) {
       console.error("No files uploaded.");
       return;
     }
 
     if (!optimize) {
+      // Resize validations
       if (formWidth && (formWidth < 1 || formWidth > 8000)) {
         dispatch({ type: "SET_DIMENSION_ERROR", payload: true });
         return;
@@ -253,16 +239,14 @@ function Form() {
     dispatch({ type: "SET_PROCESSING", payload: true });
 
     const formData = new FormData();
-
-    // Send either dimension if provided; backend already falls back to original
     if (formWidth) formData.append("width", String(formWidth));
     if (formHeight) formData.append("height", String(formHeight));
-
-    // Backend expects 'true'/'false' strings
     formData.append("optimize", optimize ? "true" : "false");
     if (optimize) formData.append("quality", String(state.quality));
+    // Optional: add convert_to if you add a format select
+    // formData.append("convert_to", selectedFormat); // '', 'jpeg', 'webp'
 
-    files.forEach((file) => formData.append("file[]", file));
+    sourceFiles.forEach((file) => formData.append("file[]", file));
 
     const responseDataArray = await handleApiCall(formData);
 
@@ -275,12 +259,10 @@ function Form() {
     responseDataArray.forEach((responseData, i) => {
       const optimizedImage = {
         filename: responseData.filename.replace(/\.[^/.]+$/, ""),
-        originalImage: URL.createObjectURL(files[i]),
+        originalImage: URL.createObjectURL(sourceFiles[i]),
         optimizedImage: responseData.optimized_image_url,
         originalSizeMB: (responseData.original_size / (1024 * 1024)).toFixed(2),
-        optimizedSizeMB: (responseData.optimized_size / (1024 * 1024)).toFixed(
-          2
-        ),
+        optimizedSizeMB: (responseData.optimized_size / (1024 * 1024)).toFixed(2),
         originalImageWidth: responseData.original_width,
         originalImageHeight: responseData.original_height,
         newImageWidth: responseData.new_width,
@@ -288,27 +270,34 @@ function Form() {
         operation: optimize ? "Optimized" : "Resized",
         quality: state.quality,
         resizedImage: responseData.resized_image_data,
+        originalFile: sourceFiles[i], // keep reference to the source file
       };
       dispatch({ type: "ADD_IMAGE", payload: optimizedImage });
     });
 
-    fileInputRef.current.value = "";
-    dispatch({ type: "SET_FILE_LIST", payload: [] });
-    setValue("width", "");
-    setValue("height", "");
+    // For RESIZE: clear selection; For OPTIMIZE: keep originals so slider reuses them
+    if (!optimize) {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      dispatch({ type: "SET_FILE_LIST", payload: [] });
+      setValue("width", "");
+      setValue("height", "");
+    }
+
     dispatch({ type: "SET_PROCESSING", payload: false });
   };
 
   const downloadAll = async () => {
+    if (!state.images || !state.images.length) return;
+
     const zip = new JSZip();
     const operation =
       state.images[0].operation === "Optimized" ? "optimized" : "resized";
     const zipFileName = `images.zip`;
 
-    const promises = state.images.map(async (image, index) => {
+    const promises = state.images.map(async (image) => {
       const response = await fetch(image.optimizedImage);
       const blob = await response.blob();
-      const fileName = `${image.filename}_${operation}.jpg`;
+      const fileName = `${image.filename}_${operation}.jpg`; // or derive from URL ext
       zip.file(fileName, blob, { binary: true });
     });
 
@@ -352,11 +341,17 @@ function Form() {
         />
 
         <ImageQualitySlider
-  quality={state.quality}
-  fileList={state.fileList}
-  disabled={state.fileList.length > 0 && state.fileList.every(f => f.type === "image/png")}
-  helperText="PNG is lossless; quality affects JPEG/WebP only."
-/>
+          quality={state.quality}
+          fileList={state.fileList}
+          disabled={qualityDisabled}
+          helperText={
+            qualityDisabled
+              ? "PNG is lossless; quality affects JPEG/WebP only."
+              : undefined
+          }
+          // Optional: trigger optimize on slider release (debounce inside slider)
+          // onChangeCommitted={() => onSubmit({}, true)}
+        />
 
         <DimensionFields
           width={width}
@@ -367,12 +362,14 @@ function Form() {
           fileList={state.fileList}
         />
 
-        {/*<AspectRatioSelect*/}
-        {/*    maintainAspectRatio={state.maintainAspectRatio}*/}
-        {/*    fileList={state.fileList}*/}
-        {/*    aspectRatio={state.aspectRatio}*/}
-        {/*    handleAspectRatioChange={handleAspectRatioChange}*/}
-        {/*/>*/}
+        {/* 
+        <AspectRatioSelect
+          maintainAspectRatio={state.maintainAspectRatio}
+          fileList={state.fileList}
+          aspectRatio={state.aspectRatio}
+          handleAspectRatioChange={handleAspectRatioChange}
+        />
+        */}
 
         <ActionButtons
           handleSubmit={handleSubmit}
@@ -380,7 +377,6 @@ function Form() {
           width={width}
           height={height}
           aspectRatio={state.aspectRatio}
-          optimizeDisabled={!hasFiles} 
         />
 
         <Box mt={2} align="center">
@@ -392,7 +388,7 @@ function Form() {
             clearAll={clearAll}
           />
 
-          {state.images && state.images?.length > 1 && <DownloadButton />}
+          {state.images && state.images.length > 1 && <DownloadButton />}
         </Box>
 
         <ImageGrid images={state.images} />

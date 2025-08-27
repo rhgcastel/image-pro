@@ -1,27 +1,52 @@
-import React, { useContext } from 'react';
-import { Typography, Slider } from '@mui/material';
+import React, { useContext, useRef } from "react";
+import { Typography, Slider, Box } from "@mui/material";
 import { ImageContext } from "../Form";
 
 function ImageQualitySlider() {
-    const { state, dispatch } = useContext(ImageContext);
-    const { quality, fileList } = state;
+  const ctx = useContext(ImageContext);
+  const { state, dispatch } = ctx;
+  const { quality, fileList = [], processing } = state || {};
 
-    return (
-        <>
-            <Typography gutterBottom>Quality ({quality})</Typography>
-            <Slider
-                value={quality}
-                onChange={(event, newValue) => dispatch({ type: 'SET_QUALITY', payload: newValue })}
-                valueLabelDisplay="auto"
-                step={1}
-                marks
-                min={1}
-                max={99}
-                disabled={fileList.length < 1}
-                sx={{ marginBottom: 2, opacity: fileList.length < 1 ? 0.2 : 1 }}
-            />
-        </>
-    );
+  const hasFiles = fileList.length > 0;
+  const allPNG = hasFiles && fileList.every(f => f.type === "image/png");
+  const disabled = !hasFiles || allPNG;
+
+  // Optional debounce if you later switch to onChange instead of onChangeCommitted
+  const debounceRef = useRef(null);
+
+  const handleChange = (_event, newValue) => {
+    dispatch({ type: "SET_QUALITY", payload: newValue });
+  };
+
+  const handleChangeCommitted = () => {
+    // Only auto-run optimize for JPEG/WebP (quality-relevant), with files loaded, and not already processing
+    if (!disabled && !processing && typeof ctx.onSubmit === "function" && typeof ctx.handleSubmit === "function") {
+      // Run optimize using originals (assuming Form onSubmit uses originals for optimize=true)
+      ctx.handleSubmit(data => ctx.onSubmit(data, true))();
+    }
+  };
+
+  return (
+    <Box sx={{ mb: 2, opacity: disabled ? 0.9 : 1 }}>
+      <Typography gutterBottom>Quality ({quality})</Typography>
+      <Slider
+        value={quality}
+        onChange={handleChange}
+        onChangeCommitted={handleChangeCommitted}
+        valueLabelDisplay="auto"
+        step={1}
+        marks
+        min={1}
+        max={99}
+        disabled={disabled}
+      />
+      {allPNG && (
+        <Typography variant="caption" sx={{ display: "block", mt: 0.5, opacity: 0.8 }}>
+          PNG is lossless; quality only affects JPEG/WebP. Use Optimize for PNG (lossless/quantized) or convert format.
+        </Typography>
+      )}
+    </Box>
+  );
 }
 
 export default ImageQualitySlider;
