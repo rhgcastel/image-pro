@@ -15,7 +15,6 @@ import DownloadButton from "./components/DownloadButton";
 import ImageGrid from "./components/ImageGrid";
 import SnackbarProcessing from "./components/SnackbarProcessing";
 import ErrorDialogs from "./components/ErrorDialogs";
-
 import { imageReducer } from "../../reducer/imageReducer";
 import { initialState } from "../../reducer/initialState";
 
