@@ -1,22 +1,24 @@
 # app.py
 from flask import Flask, request, send_from_directory, jsonify, url_for
 from flask_cors import CORS
-from PIL import Image
-import piexif
-import os, io, sys, base64, shutil, subprocess
-from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.utils import secure_filename
+
+from PIL import Image, ImageOps
+import piexif
+
+import os, io, sys, base64, shutil, subprocess
 
 # ------------------------------------------------------------------------------
-# Config (env-driven for Render)
+# Config (env-driven; works on Render free tier)
 # ------------------------------------------------------------------------------
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:3000,http://localhost:5173"
 ).split(",")
 
-# Where to keep temp/persistent files. On Render, mount a Disk at /data.
-DATA_DIR   = os.getenv("DATA_DIR", "/data")
+# Use /tmp by default so you don't need a paid disk. You may override with DATA_DIR.
+DATA_DIR   = os.getenv("DATA_DIR", "/tmp")
 INPUT_DIR  = os.getenv("INPUT_DIR",  os.path.join(DATA_DIR, "input"))
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", os.path.join(DATA_DIR, "output"))
 os.makedirs(INPUT_DIR, exist_ok=True)
@@ -29,7 +31,8 @@ PORT = int(os.getenv("PORT", "5050"))
 # Flask setup
 # ------------------------------------------------------------------------------
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # trust proxy (https URLs)
+# Ensure correct scheme/host in url_for behind Render’s proxy
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
 CORS(
     app,
@@ -73,7 +76,7 @@ def have_tool(name: str) -> bool:
 # --- PNG helpers --------------------------------------------------------------
 def compress_png_quantize(in_path, out_path, qmin=60, qmax=90, speed=1):
     """
-    Quantize + dither PNG (lossy, preserves alpha). Uses pngquant + oxipng.
+    Quantize + dither PNG (lossy-ish, preserves alpha). Uses pngquant + oxipng if available.
     """
     tmp = out_path + ".tmp.png"
     cmd = [
@@ -101,22 +104,40 @@ def compress_png_lossless(in_path, out_path):
     return True
 
 # --- JPEG helpers -------------------------------------------------------------
-def encode_jpeg_pillow(in_path, out_path, quality=82, exif_bytes=b""):
+def encode_jpeg_pillow(in_path, out_path, quality=82, keep_exif=False):
+    """
+    Re-encode JPEG with strong defaults:
+      - Auto-rotate from EXIF, then drop EXIF unless keep_exif=True
+      - Progressive, optimize, 4:2:0 subsampling
+    """
     with Image.open(in_path) as im:
-        im = im.convert("RGB")
-        im.save(out_path, format="JPEG",
-                quality=quality, optimize=True, progressive=True, subsampling=2,
-                exif=exif_bytes)
+        im = ImageOps.exif_transpose(im).convert("RGB")
+
+        save_kwargs = dict(
+            format="JPEG",
+            quality=int(quality),
+            optimize=True,
+            progressive=True,
+            subsampling="4:2:0",  # ~ Pillow's subsampling=2
+        )
+
+        if keep_exif:
+            exif = im.info.get("exif")
+            if exif:
+                save_kwargs["exif"] = exif  # keep original EXIF
+        # (Intentionally not keeping ICC profiles; they can be large.)
+
+        im.save(out_path, **save_kwargs)
 
 def encode_jpeg_mozjpeg(in_path, out_path, quality=82):
     """
     Use mozjpeg (cjpeg) if available for slightly smaller files at same quality.
-    We stage through a temp JPEG to normalize color/profile.
+    Normalize through a temporary JPEG first.
     """
     with Image.open(in_path) as im:
-        im = im.convert("RGB")
+        im = ImageOps.exif_transpose(im).convert("RGB")
         tmp = out_path + ".pre.jpg"
-        im.save(tmp, format="JPEG", quality=95)
+        im.save(tmp, format="JPEG", quality=95, optimize=True)
     ok = run(["cjpeg", "-quality", str(quality), "-progressive", "-optimize",
               "-outfile", out_path, tmp])
     try:
@@ -143,6 +164,27 @@ def encode_webp(in_path, out_path, quality=80, lossless=False):
             im.save(out_path, format="WEBP", quality=quality, method=6)
     return True
 
+def try_webp_and_pick_smaller(in_path, current_out, quality=80):
+    """
+    Encode to WebP from the (possibly resized) input and keep it only if
+    it's at least 10% smaller than the current output.
+    Returns the chosen output path.
+    """
+    alt = os.path.splitext(current_out)[0] + ".webp"
+    encode_webp(in_path, alt, quality=quality, lossless=False)
+    try:
+        if os.path.getsize(alt) < os.path.getsize(current_out) * 0.90:
+            # prefer webp; remove larger file
+            try: os.remove(current_out)
+            except: pass
+            return alt
+        else:
+            try: os.remove(alt)
+            except: pass
+            return current_out
+    except Exception:
+        return current_out
+
 # ------------------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------------------
@@ -154,10 +196,11 @@ def health():
 @app.route('/upload', methods=['POST', 'OPTIONS'])
 def upload():
     if request.method == 'OPTIONS':
+        # CORS preflight handled here
         return '', 200
 
     try:
-        # accept multiple possible field names
+        # Accept multiple possible field names
         files = []
         if "file[]" in request.files:
             files = request.files.getlist("file[]")
@@ -168,11 +211,13 @@ def upload():
         elif "image" in request.files:
             files = [request.files["image"]]
 
-        width  = _safe_int(request.form.get('width'))
-        height = _safe_int(request.form.get('height'))
-        optimize = str(request.form.get('optimize')).lower() == 'true'
-        quality  = _safe_int(request.form.get('quality'), 82) if optimize else None
-        convert_to = (request.form.get("convert_to") or "").lower()  # '', 'webp', 'jpeg'
+        width        = _safe_int(request.form.get('width'))
+        height       = _safe_int(request.form.get('height'))
+        optimize     = str(request.form.get('optimize')).lower() == 'true'
+        quality      = _safe_int(request.form.get('quality'), 82) if optimize else None
+        convert_to   = (request.form.get("convert_to") or "").lower()  # '', 'webp', 'jpeg'
+        keep_meta    = str(request.form.get("keep_metadata", "0")).lower() in ("1", "true", "yes")
+        autowebp     = str(request.form.get("autowebp", "0")).lower() in ("1", "true", "yes")
 
         if not files:
             return jsonify({"error": "No files uploaded (expected 'file[]', 'files[]', 'file' or 'image')"}), 400
@@ -190,7 +235,7 @@ def upload():
             out_path = os.path.join(OUTPUT_DIR, safe_name)
             uf.save(in_path)
 
-            # Open & basic info
+            # Basic info
             with Image.open(in_path) as img:
                 orig_w, orig_h = img.size
             original_size = os.path.getsize(in_path)
@@ -200,46 +245,37 @@ def upload():
             target_h = height or orig_h
             if width or height:
                 with Image.open(in_path) as img:
+                    # Preserve orientation during resize
+                    img = ImageOps.exif_transpose(img)
                     img = img.resize((target_w, target_h), resample=Image.LANCZOS)
-                    # keep alpha for PNG/WebP; RGB for JPEG
+                    # keep alpha for PNG/WebP; force RGB for JPEG
                     if ext in (".jpg", ".jpeg"):
                         img = img.convert("RGB")
                     img.save(in_path)  # overwrite input for next stage
 
-            # Optimize / convert
+            # Determine family
             fmt = "JPEG" if ext in (".jpg", ".jpeg") else "PNG" if ext == ".png" else None
 
             if optimize:
-                # Prepare EXIF for JPEG only
-                exif_bytes = b""
-                if fmt == "JPEG":
-                    try:
-                        with Image.open(in_path) as src:
-                            if "exif" in src.info:
-                                exif_bytes = piexif.dump(piexif.load(src.info["exif"]))
-                    except Exception:
-                        exif_bytes = b""
-
                 # --- PNG branch ------------------------------------------------
                 if fmt == "PNG":
-                    # Convert to WebP on request (usually best sizes, keeps alpha)
                     if convert_to == "webp":
                         out_path = os.path.splitext(out_path)[0] + ".webp"
                         encode_webp(in_path, out_path, quality=quality or 80, lossless=False)
                     else:
-                        # TinyPNG-like: quantize + oxipng, with quality window
+                        # Prefer binaries if present; otherwise Pillow quantization
                         qmin, qmax = 60, max(60, min(100, quality or 82))
                         if have_tool("pngquant"):
                             ok = compress_png_quantize(in_path, out_path, qmin, qmax, speed=1)
                             if not ok:
                                 compress_png_lossless(in_path, out_path)
                         else:
-                            # Fallback: simple in-process quantize (not as strong as pngquant)
                             with Image.open(in_path) as im:
                                 im = im.convert("RGBA")
-                                colors = max(16, min(256, int((quality or 82) * 2.56)))  # 0–100 → 0–256
+                                # Map 0–100 → ~32–256 colors (slightly aggressive)
+                                colors = max(32, min(256, int((quality or 82) * 2.0)))
                                 qimg = im.quantize(colors=colors, method=Image.MEDIANCUT, dither=Image.FLOYDSTEINBERG)
-                                qimg.save(out_path, format="PNG", optimize=True)
+                                qimg.save(out_path, format="PNG", optimize=True, compress_level=9)
 
                 # --- JPEG branch -----------------------------------------------
                 elif fmt == "JPEG":
@@ -247,12 +283,16 @@ def upload():
                         out_path = os.path.splitext(out_path)[0] + ".webp"
                         encode_webp(in_path, out_path, quality=quality or 80, lossless=False)
                     else:
+                        # Try mozjpeg if available; otherwise Pillow
                         if have_tool("cjpeg"):
                             ok = encode_jpeg_mozjpeg(in_path, out_path, quality=quality or 82)
                             if not ok:
-                                encode_jpeg_pillow(in_path, out_path, quality=quality or 82, exif_bytes=exif_bytes)
+                                encode_jpeg_pillow(in_path, out_path, quality=quality or 82, keep_exif=keep_meta)
                         else:
-                            encode_jpeg_pillow(in_path, out_path, quality=quality or 82, exif_bytes=exif_bytes)
+                            encode_jpeg_pillow(in_path, out_path, quality=quality or 82, keep_exif=keep_meta)
+                        # Optionally keep WebP only if smaller
+                        if autowebp:
+                            out_path = try_webp_and_pick_smaller(in_path, out_path, quality=quality or 80)
 
                 # --- Other formats ---------------------------------------------
                 else:
@@ -260,14 +300,14 @@ def upload():
                         out_path = os.path.splitext(out_path)[0] + ".webp"
                         encode_webp(in_path, out_path, quality=quality or 80, lossless=False)
                     else:
-                        # Best effort: re-save with optimize flag
+                        # Best effort re-save
                         with Image.open(in_path) as im:
                             im.save(out_path, optimize=True)
 
             else:
                 # No optimize: just save resized/original copy
                 with Image.open(in_path) as im:
-                    # keep extension format or default
+                    im = ImageOps.exif_transpose(im)
                     if fmt == "JPEG":
                         im = im.convert("RGB")
                         im.save(out_path, format="JPEG", quality=95, optimize=True, progressive=True)
@@ -279,7 +319,7 @@ def upload():
             optimized_size = os.path.getsize(out_path)
             optimized_url  = url_for('get_image', filename=os.path.basename(out_path), _external=True)
 
-            # Base64 preview only when not optimizing (to avoid big payloads)
+            # Base64 preview only when not optimizing (avoid big payloads)
             preview_b64 = ""
             if not optimize:
                 with Image.open(out_path) as preview:
@@ -311,11 +351,12 @@ def upload():
 
 @app.route('/output/<path:filename>')
 def get_image(filename):
+    # You may add Cache-Control here if you want CDN caching
     return send_from_directory(OUTPUT_DIR, filename)
 
 # ------------------------------------------------------------------------------
 # Run (use gunicorn in production; this is for local/dev)
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"Starting Flask on 0.0.0.0:{PORT}")
+    print(f"Starting Flask on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR})")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
