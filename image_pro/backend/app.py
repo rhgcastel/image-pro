@@ -3,24 +3,43 @@ from flask import Flask, request, send_from_directory, jsonify, url_for
 from flask_cors import CORS
 from PIL import Image
 import piexif
-import os, io, sys, base64, shutil, subprocess, tempfile
+import os, io, sys, base64, shutil, subprocess
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# ------------------------------------------------------------------------------
+# Config (env-driven for Render)
+# ------------------------------------------------------------------------------
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:5173"
+).split(",")
+
+# Where to keep temp/persistent files. On Render, mount a Disk at /data.
+DATA_DIR   = os.getenv("DATA_DIR", "/data")
+INPUT_DIR  = os.getenv("INPUT_DIR",  os.path.join(DATA_DIR, "input"))
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", os.path.join(DATA_DIR, "output"))
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+PORT = int(os.getenv("PORT", "5050"))
 
 # ------------------------------------------------------------------------------
 # Flask setup
 # ------------------------------------------------------------------------------
 app = Flask(__name__)
-CORS(app,
-     resources={r"/*": {"origins": ["http://localhost:3000", "http://localhost:5173"]}},
-     supports_credentials=True,
-     methods=["GET","POST","OPTIONS"],
-     allow_headers=["Content-Type","Authorization"])
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # trust proxy (https URLs)
 
-INPUT_DIR, OUTPUT_DIR = "./input", "./output"
-os.makedirs(INPUT_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=True,
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB uploads
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024  # e.g., 25MB
 
 # ------------------------------------------------------------------------------
 # Utilities
@@ -100,8 +119,10 @@ def encode_jpeg_mozjpeg(in_path, out_path, quality=82):
         im.save(tmp, format="JPEG", quality=95)
     ok = run(["cjpeg", "-quality", str(quality), "-progressive", "-optimize",
               "-outfile", out_path, tmp])
-    try: os.remove(tmp)
-    except: pass
+    try:
+        os.remove(tmp)
+    except:
+        pass
     return ok
 
 # --- WebP helper --------------------------------------------------------------
@@ -126,6 +147,7 @@ def encode_webp(in_path, out_path, quality=80, lossless=False):
 # Routes
 # ------------------------------------------------------------------------------
 @app.get("/health")
+@app.get("/healthz")
 def health():
     return jsonify(ok=True)
 
@@ -276,8 +298,10 @@ def upload():
             })
 
             # cleanup input copy
-            try: os.remove(in_path)
-            except: pass
+            try:
+                os.remove(in_path)
+            except:
+                pass
 
         return jsonify(resp), 200
 
@@ -290,8 +314,8 @@ def get_image(filename):
     return send_from_directory(OUTPUT_DIR, filename)
 
 # ------------------------------------------------------------------------------
-# Run
+# Run (use gunicorn in production; this is for local/dev)
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Starting Flask on http://127.0.0.1:5050")
-    app.run(host="127.0.0.1", port=5050, debug=False, threaded=True)
+    print(f"Starting Flask on 0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
